@@ -92,6 +92,12 @@ RESEARCHER_ODT=Path("/opt/family-tree/Researcher.odt")
 PROOF_NAME="761327132.txt"
 
 COUNTDOWN_DEADLINE=dt.datetime(2026,8,29,23,55,0)
+RELIABILITY_END=dt.datetime(2026,9,2,23,59,59)
+SPECIAL_PROOFS=[
+    ("243234.txt", dt.datetime(2026,8,29,12,40,0)),
+    ("2433213324.txt", dt.datetime(2026,8,29,13,30,0)),
+    ("244232.txt", dt.datetime(2026,8,29,15,30,0)),
+]
 RESEARCH_START=dt.datetime(2026,8,29,16,0,0)
 BASELINE_UNLOCK=dt.datetime(2026,9,7,14,0,0)
 
@@ -192,6 +198,30 @@ CREATE TABLE IF NOT EXISTS audit_log(
     new_value TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
     source_url TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS reliability_events(
+    id INTEGER PRIMARY KEY,
+    event_key TEXT NOT NULL UNIQUE,
+    scheduled_for TEXT NOT NULL,
+    proof_name TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    completed_at TEXT NOT NULL DEFAULT '',
+    github_ok INTEGER NOT NULL DEFAULT 0,
+    hf_ok INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS research_publications(
+    id INTEGER PRIMARY KEY,
+    published_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_file TEXT NOT NULL,
+    detail_key TEXT NOT NULL,
+    detail_text TEXT NOT NULL,
+    github_ok INTEGER NOT NULL DEFAULT 0,
+    hf_ok INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(detail_key)
 );
 
 CREATE TABLE IF NOT EXISTS state(
@@ -539,7 +569,7 @@ def save_web_capture(pid,url,title,text):
 def duckduckgo_search(query,limit=10):
     """Best-effort public search. Does not bypass blocks or CAPTCHAs."""
     url="https://html.duckduckgo.com/html/?q="+urllib.parse.quote_plus(query)
-    req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 TGFamilyTree/4.1"})
+    req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 TGFamilyTree/4.2"})
     with urllib.request.urlopen(req,timeout=25) as r:
         raw=r.read(2_000_000).decode("utf-8","replace")
     out=[]
@@ -598,6 +628,267 @@ def run_background_research():
     c.commit();c.close()
     print(f"Staged {total} public research-result links.")
 
+
+# ------------------------- reliability-test publishing -------------------------
+
+def public_file_urls(filename):
+    cfg=load_config()
+    gh=cfg.get("github_proof_url","").strip()
+    hf=cfg.get("hf_proof_url","").strip()
+    if not gh or not hf:
+        raise RuntimeError("Public GitHub and Hugging Face proof URLs are not configured.")
+    gh_base=gh.rsplit("/",1)[0]
+    hf_base=hf.rsplit("/",1)[0]
+    return gh_base+"/"+filename, hf_base+"/"+filename
+
+def create_named_proof(filename, event_key):
+    ensure_dirs()
+    tree=export_public()
+    digest=hashlib.sha256(tree.read_bytes()).hexdigest()
+    content=(
+        "TG FAMILY TREE AUTOMATED RELIABILITY PROOF\n"
+        f"event={event_key}\n"
+        f"filename={filename}\n"
+        f"generated_by={Path(__file__).name}\n"
+        f"generated_at={now_local().astimezone().isoformat()}\n"
+        f"tree_sha256={digest}\n"
+        f"nonce={secrets.token_hex(16)}\n"
+    )
+    p=PUBLISH_DIR/filename
+    p.write_text(content,encoding="utf-8")
+    return p
+
+def push_publish_directory(commit_message):
+    cfg=load_config()
+    if not cfg.get("github_remote"):
+        raise RuntimeError("GitHub remote is not configured.")
+    ensure_publish_repo(cfg)
+    run(["git","add","-A"],cwd=PUBLISH_DIR)
+    if run(["git","status","--porcelain"],cwd=PUBLISH_DIR):
+        run(["git","commit","-m",commit_message],cwd=PUBLISH_DIR)
+    run(["git","push","github",f"HEAD:{cfg.get('branch','main')}"],cwd=PUBLISH_DIR)
+    # v4.1+ has upload_huggingface. Fall back to HF git remote only if present.
+    if "upload_huggingface" in globals():
+        upload_huggingface(cfg)
+    else:
+        rem=set(run(["git","remote"],cwd=PUBLISH_DIR,check=False).split())
+        if "hf" not in rem:
+            raise RuntimeError("Hugging Face publisher is not configured.")
+        run(["git","push","hf",f"HEAD:{cfg.get('branch','main')}"],cwd=PUBLISH_DIR)
+
+def verify_named_file(filename):
+    local=PUBLISH_DIR/filename
+    if not local.exists():
+        return False,False,f"Local {filename} does not exist."
+    expected=local.read_text(encoding="utf-8").strip()
+    gh_url,hf_url=public_file_urls(filename)
+    out=[]
+    gh_ok=hf_ok=False
+    try:
+        got=fetch_text(gh_url).strip()
+        gh_ok=(got==expected)
+        out.append(f"GitHub {filename}: {'VERIFIED' if gh_ok else 'CONTENT MISMATCH'}")
+    except Exception as e:
+        out.append(f"GitHub {filename}: ERROR {e}")
+    try:
+        got=fetch_text(hf_url).strip()
+        hf_ok=(got==expected)
+        out.append(f"Hugging Face {filename}: {'VERIFIED' if hf_ok else 'CONTENT MISMATCH'}")
+    except Exception as e:
+        out.append(f"Hugging Face {filename}: ERROR {e}")
+    return gh_ok,hf_ok,"\n".join(out)
+
+def record_reliability(event_key,scheduled_for,proof_name,gh_ok,hf_ok,detail="",error=""):
+    c=db()
+    c.execute("""INSERT INTO reliability_events
+        (event_key,scheduled_for,proof_name,started_at,completed_at,github_ok,hf_ok,detail,error)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(event_key) DO UPDATE SET
+          proof_name=excluded.proof_name,
+          completed_at=excluded.completed_at,
+          github_ok=excluded.github_ok,
+          hf_ok=excluded.hf_ok,
+          detail=excluded.detail,
+          error=excluded.error""",
+        (event_key,scheduled_for.isoformat(),proof_name,now_local().isoformat(),now_local().isoformat(),
+         int(gh_ok),int(hf_ok),detail,error))
+    c.commit();c.close()
+
+def run_special_proof(filename,scheduled_for):
+    event_key=f"special:{filename}"
+    try:
+        create_named_proof(filename,event_key)
+        push_publish_directory(f"Automated reliability proof {filename}")
+        gh_ok=hf_ok=False;msg=""
+        for delay in (0,5,15,30):
+            if delay: time.sleep(delay)
+            gh_ok,hf_ok,msg=verify_named_file(filename)
+            if gh_ok and hf_ok: break
+        record_reliability(event_key,scheduled_for,filename,gh_ok,hf_ok,detail=msg)
+        if not (gh_ok and hf_ok):
+            raise RuntimeError(msg)
+        print(msg)
+    except Exception as e:
+        record_reliability(event_key,scheduled_for,filename,False,False,error=str(e))
+        raise
+
+def choose_one_research_detail():
+    """Choose exactly one still-unpublished detail from Researcher.odt."""
+    cfg=load_config()
+    path=Path(cfg.get("researcher_odt",str(RESEARCHER_ODT)))
+    lines=extract_odt_text(path)
+    c=db()
+    used={r["detail_key"] for r in c.execute("SELECT detail_key FROM research_publications")}
+    c.close()
+    # Prefer meaningful genealogy statements, skip obvious boilerplate/URLs.
+    for line in lines:
+        text=re.sub(r"\s+"," ",line).strip()
+        if len(text)<35 or len(text)>500: continue
+        low=text.casefold()
+        if text.startswith("http") or "for my kayaking post" in low: continue
+        if re.match(r"^[,0-9=./~ -]+$",text): continue
+        if any(k in low for k in ("born","died","father","mother","daughter","son","genealogy","research","family","record","census","marriage")):
+            key=hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if key not in used:
+                return key,text,str(path)
+    raise RuntimeError("No unpublished Researcher.odt detail was available.")
+
+def publish_one_research_detail():
+    # The 4:00 PM checkpoint first performs the normal Researcher.odt research pass,
+    # then publishes exactly one previously unpublished Researcher.odt detail.
+    run_background_research()
+    key,text,path=choose_one_research_detail()
+    ensure_dirs()
+    payload={
+        "published_at":now_local().astimezone().isoformat(),
+        "source":"Researcher.odt",
+        "detail_key":key,
+        "detail":text,
+        "status":"provisional/white research detail"
+    }
+    out=PUBLISH_DIR/"researcher_daily_detail.json"
+    out.write_text(json.dumps(payload,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
+    push_publish_directory("Automated Researcher.odt daily detail")
+    gh_url,hf_url=public_file_urls("researcher_daily_detail.json")
+    expected=out.read_text(encoding="utf-8").strip()
+    gh_ok=hf_ok=False
+    messages=[]
+    for name,url in (("GitHub",gh_url),("Hugging Face",hf_url)):
+        try:
+            ok=(fetch_text(url).strip()==expected)
+            if name=="GitHub": gh_ok=ok
+            else: hf_ok=ok
+            messages.append(f"{name} research detail: {'VERIFIED' if ok else 'CONTENT MISMATCH'}")
+        except Exception as e:
+            messages.append(f"{name} research detail: ERROR {e}")
+    c=db()
+    c.execute("""INSERT OR IGNORE INTO research_publications
+        (source_file,detail_key,detail_text,github_ok,hf_ok) VALUES(?,?,?,?,?)""",
+        (path,key,text,int(gh_ok),int(hf_ok)))
+    c.commit();c.close()
+    record_reliability("research:2026-08-29-1600",dt.datetime(2026,8,29,16,0,0),
+                       "researcher_daily_detail.json",gh_ok,hf_ok,detail="\n".join(messages))
+    if not (gh_ok and hf_ok):
+        raise RuntimeError("\n".join(messages))
+    print("\n".join(messages))
+
+def reliability_healthy():
+    """Healthy means every planned Aug29-Sep2 checkpoint exists and passed."""
+    required={
+        "special:243234.txt",
+        "special:2433213324.txt",
+        "special:244232.txt",
+        "research:2026-08-29-1600",
+        "daily:2026-08-29",
+        "daily:2026-08-30",
+        "daily:2026-08-31",
+        "daily:2026-09-01",
+        "daily:2026-09-02",
+    }
+    c=db()
+    rows={r["event_key"]:r for r in c.execute(
+        "SELECT event_key,github_ok,hf_ok,error FROM reliability_events WHERE scheduled_for<=?",
+        (RELIABILITY_END.isoformat(),))}
+    c.close()
+    if not required.issubset(rows):
+        return False
+    return all(rows[k]["github_ok"] and rows[k]["hf_ok"] and not rows[k]["error"] for k in required)
+
+def diagnostic_prompt(problem,suggestions):
+    when=now_local().astimezone().strftime("%B %d, %Y %I:%M:%S %p %Z")
+    suggestions=suggestions or [
+        "Check GitHub authentication and repository permissions.",
+        "Check Hugging Face authentication and dataset write permissions.",
+        "Verify both configured public URLs and repository names.",
+        "Inspect the systemd user service logs for the failed publication run.",
+        "Retry the Python publisher after correcting the first failing step."
+    ]
+    return (
+        f"Dear Chatgpt, today is {when} and the problem that we're having is "
+        f"{problem}. Please provide an update to get that to work by "
+        f"{'; '.join(suggestions)}. Thanks! Jerry O'Neal (Jeremiah O'Neal)."
+    )
+
+def save_diagnostic_prompt(problem,suggestions=None):
+    prompt=diagnostic_prompt(problem,suggestions)
+    p=DATA_HOME/"SEND_TO_CHATGPT.txt"
+    p.write_text(prompt+"\n",encoding="utf-8")
+    c=db()
+    c.execute("INSERT OR REPLACE INTO state(key,value) VALUES('last_diagnostic_prompt',?)",(prompt,))
+    c.commit();c.close()
+    return prompt,p
+
+def daily_reliability_publish():
+    """
+    Through Sep 2: publish + verify.
+    After Sep 2: if reliability history is healthy, publish normally without extra
+    public-download verification. If unhealthy, keep verifying and generate the prompt.
+    """
+    cfg=load_config()
+    after=now_local()>RELIABILITY_END
+    if after and reliability_healthy():
+        # Continue updating both services but no extra public verification.
+        export_public()
+        push_publish_directory(f"Automated daily family-tree update {dt.date.today().isoformat()}")
+        c=db()
+        c.execute("INSERT OR REPLACE INTO state(key,value) VALUES('last_upload_date',?)",(dt.date.today().isoformat(),))
+        c.commit();c.close()
+        print("Published to GitHub and Hugging Face; verification retired after healthy Sep 2 checkpoint.")
+        return
+    try:
+        daily_sync(True)
+        record_reliability(f"daily:{dt.date.today().isoformat()}",now_local(),
+                           PROOF_NAME,True,True,detail="daily verified publication")
+    except Exception as e:
+        prompt,path=save_diagnostic_prompt(
+            str(e),
+            ["Check the configured GitHub remote and authentication",
+             "Check the Hugging Face dataset ID and hf authentication",
+             "Verify the public raw/resolve URLs",
+             "Review tg-family-tree-sync.service logs",
+             "Update the Python publishing code if an API or CLI changed"]
+        )
+        print(prompt)
+        print(f"Saved diagnostic prompt to {path}")
+        raise
+
+def startup_delayed_check():
+    """Invoked 10 minutes after GUI startup, but only if today's normal publish has not succeeded."""
+    today=dt.date.today().isoformat()
+    c=db()
+    done=c.execute("SELECT value FROM state WHERE key='last_upload_date'").fetchone()
+    prior=c.execute("SELECT value FROM state WHERE key='startup_check_date'").fetchone()
+    c.close()
+    if (done and done["value"]==today) or (prior and prior["value"]==today):
+        print("Today's publication already completed; startup+10-minute fallback skipped.")
+        return
+    try:
+        daily_reliability_publish()
+    finally:
+        c=db()
+        c.execute("INSERT OR REPLACE INTO state(key,value) VALUES('startup_check_date',?)",(today,))
+        c.commit();c.close()
+
 # ------------------------- publication proof -------------------------
 
 def export_public():
@@ -631,7 +922,7 @@ def create_proof_file():
     p=PUBLISH_DIR/PROOF_NAME;p.write_text(content);return p
 
 def fetch_text(url,timeout=20):
-    req=urllib.request.Request(url,headers={"User-Agent":"TGFamilyTree/4.1"})
+    req=urllib.request.Request(url,headers={"User-Agent":"TGFamilyTree/4.2"})
     with urllib.request.urlopen(req,timeout=timeout) as r:return r.read(2_000_000).decode("utf-8","replace")
 
 def verify_proof_online():
@@ -715,7 +1006,7 @@ def install_timers():
 Description=Publish and verify TG Family Tree
 [Service]
 Type=oneshot
-ExecStart={sys.executable} {script} --daily-sync
+ExecStart={sys.executable} {script} --daily-reliability
 """)
     (unit/"tg-family-tree-sync.timer").write_text("""[Unit]
 Description=Daily verified TG Family Tree publisher
@@ -741,8 +1032,49 @@ Unit=tg-family-tree-research.service
 [Install]
 WantedBy=timers.target
 """)
+    # One-time reliability checkpoints on Aug 29, 2026.
+    specials=[
+        ("tg-family-tree-proof-1240","2026-08-29 12:40:00","243234.txt"),
+        ("tg-family-tree-proof-1330","2026-08-29 13:30:00","2433213324.txt"),
+        ("tg-family-tree-proof-1530","2026-08-29 15:30:00","244232.txt"),
+    ]
+    for unit_name,when,filename in specials:
+        (unit/f"{unit_name}.service").write_text(f"""[Unit]
+Description=TG Family Tree one-time reliability proof {filename}
+[Service]
+Type=oneshot
+ExecStart={sys.executable} {script} --special-proof {filename}
+""")
+        (unit/f"{unit_name}.timer").write_text(f"""[Unit]
+Description=TG Family Tree one-time reliability proof {filename}
+[Timer]
+OnCalendar={when}
+Persistent=true
+Unit={unit_name}.service
+[Install]
+WantedBy=timers.target
+""")
+    (unit/"tg-family-tree-research-20260829.service").write_text(f"""[Unit]
+Description=TG Family Tree Aug 29 Researcher.odt detail publish
+[Service]
+Type=oneshot
+ExecStart={sys.executable} {script} --publish-one-research-detail
+""")
+    (unit/"tg-family-tree-research-20260829.timer").write_text("""[Unit]
+Description=TG Family Tree Aug 29 Researcher.odt detail publish
+[Timer]
+OnCalendar=2026-08-29 16:00:00
+Persistent=true
+Unit=tg-family-tree-research-20260829.service
+[Install]
+WantedBy=timers.target
+""")
+
     run(["systemctl","--user","daemon-reload"])
-    run(["systemctl","--user","enable","--now","tg-family-tree-sync.timer","tg-family-tree-research.timer"])
+    run(["systemctl","--user","enable","--now",
+         "tg-family-tree-sync.timer","tg-family-tree-research.timer",
+         "tg-family-tree-proof-1240.timer","tg-family-tree-proof-1330.timer",
+         "tg-family-tree-proof-1530.timer","tg-family-tree-research-20260829.timer"])
     return run(["systemctl","--user","list-timers","tg-family-tree-*","--no-pager"],check=False)
 
 # ------------------------- GUI -------------------------
@@ -764,7 +1096,7 @@ def async_call(fn,done=None,error=None):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__();seed()
-        self.setWindowTitle("TG Family Tree v4.1")
+        self.setWindowTitle("TG Family Tree v4.2")
         self.resize(1350,880)
         self.context_pid=None
         self.context_name=""
@@ -780,6 +1112,11 @@ class MainWindow(QMainWindow):
         self.build_countdown_tab()
         self.refresh_tree()
         self.timer=QTimer(self);self.timer.timeout.connect(self.tick);self.timer.start(1000);self.tick()
+        # Independent daily safety check ten minutes after GUI startup.
+        self.startup_check_timer=QTimer(self)
+        self.startup_check_timer.setSingleShot(True)
+        self.startup_check_timer.timeout.connect(self.run_startup_reliability_check)
+        self.startup_check_timer.start(10*60*1000)
 
     def blue_font(self):
         f=QFont();f.setBold(True);return f
@@ -1074,24 +1411,71 @@ class MainWindow(QMainWindow):
                        lambda e:self.pub_status.appendPlainText("ERROR: "+e))
         self.worker_refs.append(sig)
 
+    def run_startup_reliability_check(self):
+        def ok(_):
+            self.count_status.setText("Startup+10-minute publication check completed.")
+        def err(e):
+            try:
+                prompt,path=save_diagnostic_prompt(str(e))
+                self.count_status.setText(f"Publication check failed. Send-to-ChatGPT prompt saved: {path}")
+            except Exception:
+                self.count_status.setText("Publication check failed; see Publishing/Audit.")
+        sig=async_call(startup_delayed_check,ok,err)
+        self.worker_refs.append(sig)
+
     # ----- Countdown
     def build_countdown_tab(self):
         w=QWidget();lay=QVBoxLayout(w)
-        h=QLabel("Automated publishing proof countdown");h.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        h=QLabel("Aug 29 automated reliability countdown");h.setAlignment(Qt.AlignmentFlag.AlignCenter)
         h.setStyleSheet("font-size:22px;font-weight:bold");lay.addWidget(h)
         self.count=QLabel("");self.count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.count.setStyleSheet("font-family:monospace;font-size:38px;font-weight:bold");lay.addWidget(self.count)
-        self.count_status=QLabel("Stops early only after GitHub + Hugging Face public proof both verify.")
+        self.count_status=QLabel("Next checkpoint will appear here. After the 4:00 PM research checkpoint, this countdown turns off; daily reliability checks continue in the background through Sep 2.")
+        self.count_status.setWordWrap(True)
         self.count_status.setAlignment(Qt.AlignmentFlag.AlignCenter);lay.addWidget(self.count_status)
-        lay.addStretch();self.tabs.addTab(w,"Countdown")
+        self.reliability_box=QPlainTextEdit();self.reliability_box.setReadOnly(True);lay.addWidget(self.reliability_box)
+        lay.addStretch();self.tabs.addTab(w,"Countdown / Reliability")
 
     def tick(self):
         c=db();v=c.execute("SELECT value FROM state WHERE key='proof_verified_at'").fetchone();c.close()
         if v:
             self.count.setText("VERIFIED ✓");self.count_status.setText(f"Stopped: both public copies verified at {v['value']}.");return
-        rem=max(dt.timedelta(0),COUNTDOWN_DEADLINE-now_local());s=int(rem.total_seconds())
-        self.count.setText(f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}")
-        if s==0:self.count_status.setText("Deadline reached without a recorded dual public verification.")
+        now=now_local()
+        checkpoints=[
+            ("12:40 PM: upload + verify 243234.txt",dt.datetime(2026,8,29,12,40,0),"special:243234.txt"),
+            ("1:30 PM: upload + verify 2433213324.txt",dt.datetime(2026,8,29,13,30,0),"special:2433213324.txt"),
+            ("3:30 PM: upload + verify 244232.txt",dt.datetime(2026,8,29,15,30,0),"special:244232.txt"),
+            ("4:00 PM: research Researcher.odt + publish/verify one detail",dt.datetime(2026,8,29,16,0,0),"research:2026-08-29-1600"),
+        ]
+        c=db()
+        rows=list(c.execute("SELECT * FROM reliability_events ORDER BY scheduled_for"))
+        completed={r["event_key"] for r in rows if r["github_ok"] and r["hf_ok"]}
+        diag=c.execute("SELECT value FROM state WHERE key='last_diagnostic_prompt'").fetchone()
+        c.close()
+        upcoming=None
+        for label,when,key in checkpoints:
+            if key not in completed and now <= when:
+                upcoming=(label,when,key);break
+            if key not in completed and now > when:
+                upcoming=(label,when,key);break
+        if upcoming:
+            label,when,key=upcoming
+            rem=max(dt.timedelta(0),when-now);sec=int(rem.total_seconds())
+            self.count.setText(f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}")
+            if sec:
+                self.count_status.setText("Next: "+label)
+            else:
+                self.count_status.setText("Checkpoint is due now: "+label)
+        else:
+            self.count.setText("OFF")
+            self.count_status.setText("Aug 29 countdown complete. Daily 6:00 AM / startup+10-minute reliability checks continue through Sep 2.")
+        lines=[]
+        for r in rows:
+            ok="VERIFIED" if r["github_ok"] and r["hf_ok"] else ("FAILED" if r["error"] else "RECORDED")
+            lines.append(f"{r['scheduled_for']}  {r['event_key']}  {ok}\n{r['detail'] or r['error']}")
+        if diag:
+            lines.append("\nSEND TO CHATGPT IF NEEDED:\n"+diag["value"])
+        self.reliability_box.setPlainText("\n\n".join(lines))
 
 def resolve_text(text):
     seed();c=db();q=text.casefold();out=[]
@@ -1111,6 +1495,10 @@ def main():
     ap.add_argument("--verify-proof",action="store_true")
     ap.add_argument("--research",action="store_true")
     ap.add_argument("--install-timers",action="store_true")
+    ap.add_argument("--daily-reliability",action="store_true")
+    ap.add_argument("--special-proof")
+    ap.add_argument("--publish-one-research-detail",action="store_true")
+    ap.add_argument("--startup-check",action="store_true")
     ap.add_argument("--resolve")
     args=ap.parse_args();seed()
     if args.daily_sync or args.force_sync:daily_sync(args.force_sync);return
@@ -1118,6 +1506,14 @@ def main():
         ok,msg=verify_proof_online();print(msg);raise SystemExit(0 if ok else 1)
     if args.research:run_background_research();return
     if args.install_timers:print(install_timers());return
+    if args.daily_reliability:daily_reliability_publish();return
+    if args.special_proof:
+        schedule=dict((name,when) for name,when in SPECIAL_PROOFS)
+        if args.special_proof not in schedule:
+            raise SystemExit(f"Unknown special proof {args.special_proof}")
+        run_special_proof(args.special_proof,schedule[args.special_proof]);return
+    if args.publish_one_research_detail:publish_one_research_detail();return
+    if args.startup_check:startup_delayed_check();return
     if args.resolve is not None:print(json.dumps(resolve_text(args.resolve),indent=2));return
     app=QApplication(sys.argv);win=MainWindow();win.show();raise SystemExit(app.exec())
 
