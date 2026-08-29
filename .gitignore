@@ -1,0 +1,23 @@
+# Never publish credentials, private configuration, or source research documents.
+*.odt
+Researcher.odt
+*.token
+*.secret
+*.credentials
+.env
+.env.*
+config*.json
+
+# Runtime/cache files.
+__pycache__/
+*.pyc
+*.pyo
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+web-cache/
+research-v4/
+tmp/
+
+# Backups.
+*.backup-*
