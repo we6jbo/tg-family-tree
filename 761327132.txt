@@ -1,6 +1,6 @@
 TG FAMILY TREE AUTOMATED PUBLISH PROOF
 proof_id=761327132
 generated_by=tg_family_tree.py
-generated_at=2026-08-29T12:20:49.572233-07:00
-tree_sha256=dcf3a024fd0b91c2c6c172b51c8a9c58b4dd82ec0bd739c52073cad3d5bf8d8a
-nonce=a0ad805ba02a2b1491a8af89f16fbcd9
+generated_at=2026-08-29T14:28:45.429075-07:00
+tree_sha256=2889c7be47f76fe327a1261740426244aeca95b25dee65815caae899091cb9b9
+nonce=39e5d12524a89a721e20fefd40de2250
